@@ -12,9 +12,10 @@ A股自选股智能分析系统 - AI分析层
 
 import json
 import logging
+import random
 import time
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 
 from tenacity import (
     retry,
@@ -382,28 +383,51 @@ class GeminiAnalyzer:
 4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
 5. **风险优先级**：舆情中的风险点要醒目标出"""
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, api_keys: Optional[List[str]] = None):
         """
         初始化 AI 分析器
         
         优先级：Gemini > OpenAI 兼容 API
+        支持多个 Gemini API Keys，随机选择并支持故障切换
         
         Args:
-            api_key: Gemini API Key（可选，默认从配置读取）
+            api_key: 单个 Gemini API Key（可选，向后兼容）
+            api_keys: 多个 Gemini API Keys 列表（可选，默认从配置读取）
         """
         config = get_config()
-        self._api_key = api_key or config.gemini_api_key
+        
+        # 支持多个 API Keys
+        if api_keys:
+            self._api_keys = api_keys
+        elif api_key:
+            self._api_keys = [api_key]
+        else:
+            self._api_keys = config.gemini_api_keys.copy()
+        
+        # 过滤无效的 keys
+        self._api_keys = [
+            k for k in self._api_keys 
+            if k and not k.startswith('your_') and len(k) > 10
+        ]
+        
+        # 当前使用的 key 索引
+        self._current_key_index = 0
+        # 已尝试失败的 keys（在当前请求周期内）
+        self._failed_keys: Set[str] = set()
+        
         self._model = None
         self._current_model_name = None  # 当前使用的模型名称
         self._using_fallback = False  # 是否正在使用备选模型
         self._use_openai = False  # 是否使用 OpenAI 兼容 API
         self._openai_client = None  # OpenAI 客户端
         
-        # 检查 Gemini API Key 是否有效（过滤占位符）
-        gemini_key_valid = self._api_key and not self._api_key.startswith('your_') and len(self._api_key) > 10
+        # 随机选择一个初始 key
+        if self._api_keys:
+            self._current_key_index = random.randint(0, len(self._api_keys) - 1)
+            logger.info(f"Gemini API Keys 已加载: {len(self._api_keys)} 个，随机选择第 {self._current_key_index + 1} 个")
         
         # 优先尝试初始化 Gemini
-        if gemini_key_valid:
+        if self._api_keys:
             try:
                 self._init_model()
             except Exception as e:
@@ -458,6 +482,69 @@ class GeminiAnalyzer:
         except Exception as e:
             logger.error(f"OpenAI 兼容 API 初始化失败: {e}")
     
+    @property
+    def _current_api_key(self) -> Optional[str]:
+        """获取当前使用的 API Key"""
+        if not self._api_keys:
+            return None
+        return self._api_keys[self._current_key_index % len(self._api_keys)]
+    
+    def _switch_to_next_key(self) -> bool:
+        """
+        切换到下一个可用的 API Key
+        
+        Returns:
+            是否成功切换（如果所有 key 都已尝试失败则返回 False）
+        """
+        if len(self._api_keys) <= 1:
+            return False
+        
+        # 标记当前 key 为失败
+        current_key = self._current_api_key
+        if current_key:
+            self._failed_keys.add(current_key)
+        
+        # 寻找下一个未失败的 key
+        for i in range(len(self._api_keys)):
+            next_index = (self._current_key_index + i + 1) % len(self._api_keys)
+            next_key = self._api_keys[next_index]
+            if next_key not in self._failed_keys:
+                self._current_key_index = next_index
+                logger.info(f"[Gemini] 切换到第 {next_index + 1}/{len(self._api_keys)} 个 API Key")
+                # 重新初始化模型
+                try:
+                    self._reinit_model_with_current_key()
+                    return True
+                except Exception as e:
+                    logger.warning(f"[Gemini] Key {next_index + 1} 初始化失败: {e}")
+                    self._failed_keys.add(next_key)
+        
+        logger.warning(f"[Gemini] 所有 {len(self._api_keys)} 个 API Key 都已尝试失败")
+        return False
+    
+    def _reinit_model_with_current_key(self) -> None:
+        """使用当前 key 重新初始化模型"""
+        import google.generativeai as genai
+        
+        current_key = self._current_api_key
+        if not current_key:
+            raise ValueError("没有可用的 API Key")
+        
+        genai.configure(api_key=current_key)
+        
+        config = get_config()
+        model_name = self._current_model_name or config.gemini_model
+        
+        self._model = genai.GenerativeModel(
+            model_name=model_name,
+            system_instruction=self.SYSTEM_PROMPT,
+        )
+        logger.debug(f"[Gemini] 模型重新初始化成功，使用 Key #{self._current_key_index + 1}")
+    
+    def _reset_failed_keys(self) -> None:
+        """重置失败的 keys 记录（每次新请求开始时调用）"""
+        self._failed_keys.clear()
+    
     def _init_model(self) -> None:
         """
         初始化 Gemini 模型
@@ -465,12 +552,16 @@ class GeminiAnalyzer:
         配置：
         - 使用 gemini-3-flash-preview 或 gemini-2.5-flash 模型
         - 不启用 Google Search（使用外部 Tavily/SerpAPI 搜索）
+        - 支持多 API Key 轮换
         """
         try:
             import google.generativeai as genai
             
-            # 配置 API Key
-            genai.configure(api_key=self._api_key)
+            # 配置 API Key（使用当前选择的 key）
+            current_key = self._current_api_key
+            if not current_key:
+                raise ValueError("没有可用的 Gemini API Key")
+            genai.configure(api_key=current_key)
             
             # 从配置获取模型名称
             config = get_config()
@@ -488,7 +579,8 @@ class GeminiAnalyzer:
                 )
                 self._current_model_name = model_name
                 self._using_fallback = False
-                logger.info(f"Gemini 模型初始化成功 (模型: {model_name})")
+                key_info = f"Key #{self._current_key_index + 1}/{len(self._api_keys)}" if len(self._api_keys) > 1 else ""
+                logger.info(f"Gemini 模型初始化成功 (模型: {model_name}) {key_info}")
             except Exception as model_error:
                 # 尝试备选模型
                 logger.warning(f"主模型 {model_name} 初始化失败: {model_error}，尝试备选模型 {fallback_model}")
@@ -587,14 +679,15 @@ class GeminiAnalyzer:
     
     def _call_api_with_retry(self, prompt: str, generation_config: dict) -> str:
         """
-        调用 AI API，带有重试和模型切换机制
+        调用 AI API，带有重试、Key 轮换和模型切换机制
         
-        优先级：Gemini > Gemini 备选模型 > OpenAI 兼容 API
+        优先级：Gemini（多 Key 轮换） > Gemini 备选模型 > OpenAI 兼容 API
         
         处理 429 限流错误：
-        1. 先指数退避重试
-        2. 多次失败后切换到备选模型
-        3. Gemini 完全失败后尝试 OpenAI
+        1. 先尝试切换到其他 API Key
+        2. 所有 Key 都失败后指数退避重试
+        3. 多次失败后切换到备选模型
+        4. Gemini 完全失败后尝试 OpenAI
         
         Args:
             prompt: 提示词
@@ -614,13 +707,17 @@ class GeminiAnalyzer:
         last_error = None
         tried_fallback = getattr(self, '_using_fallback', False)
         
+        # 重置失败 key 记录（新请求周期开始）
+        self._reset_failed_keys()
+        
         for attempt in range(max_retries):
             try:
                 # 请求前增加延时（防止请求过快触发限流）
                 if attempt > 0:
                     delay = base_delay * (2 ** (attempt - 1))  # 指数退避: 5, 10, 20, 40...
                     delay = min(delay, 60)  # 最大60秒
-                    logger.info(f"[Gemini] 第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
+                    key_info = f"(Key #{self._current_key_index + 1})" if len(self._api_keys) > 1 else ""
+                    logger.info(f"[Gemini] 第 {attempt + 1} 次重试 {key_info}，等待 {delay:.1f} 秒...")
                     time.sleep(delay)
                 
                 response = self._model.generate_content(
@@ -638,14 +735,24 @@ class GeminiAnalyzer:
                 last_error = e
                 error_str = str(e)
                 
-                # 检查是否是 429 限流错误
+                # 检查是否是 429 限流错误或配额错误
                 is_rate_limit = '429' in error_str or 'quota' in error_str.lower() or 'rate' in error_str.lower()
+                is_key_error = 'api_key' in error_str.lower() or 'invalid' in error_str.lower() or 'permission' in error_str.lower()
                 
-                if is_rate_limit:
-                    logger.warning(f"[Gemini] API 限流 (429)，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+                key_info = f"(Key #{self._current_key_index + 1}/{len(self._api_keys)})" if len(self._api_keys) > 1 else ""
+                
+                if is_rate_limit or is_key_error:
+                    logger.warning(f"[Gemini] API 限流/错误 {key_info}，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
                     
-                    # 如果已经重试了一半次数且还没切换过备选模型，尝试切换
+                    # 优先尝试切换到其他 API Key
+                    if len(self._api_keys) > 1 and self._switch_to_next_key():
+                        logger.info(f"[Gemini] 已切换到新的 API Key，继续重试")
+                        continue  # 立即重试，不增加等待时间
+                    
+                    # 所有 key 都失败后，如果已经重试了一半次数且还没切换过备选模型，尝试切换模型
                     if attempt >= max_retries // 2 and not tried_fallback:
+                        # 重置失败 key 记录，允许用不同模型再试一轮
+                        self._reset_failed_keys()
                         if self._switch_to_fallback_model():
                             tried_fallback = True
                             logger.info("[Gemini] 已切换到备选模型，继续重试")
@@ -653,7 +760,7 @@ class GeminiAnalyzer:
                             logger.warning("[Gemini] 切换备选模型失败，继续使用当前模型重试")
                 else:
                     # 非限流错误，记录并继续重试
-                    logger.warning(f"[Gemini] API 调用失败，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+                    logger.warning(f"[Gemini] API 调用失败 {key_info}，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
         
         # Gemini 所有重试都失败，尝试 OpenAI 兼容 API
         if self._openai_client:

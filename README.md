@@ -49,7 +49,7 @@
 
 | Secret 名称 | 说明 | 必填 |
 |------------|------|:----:|
-| `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/) 获取 | ✅* |
+| `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/) 获取，**支持多个 Key 逗号分隔** | ✅* |
 | `WECHAT_WEBHOOK_URL` | 企业微信机器人 Webhook | ✅ |
 | `STOCK_LIST` | 自选股代码，如 `600519,300750,002594` | ✅ |
 | `TAVILY_API_KEYS` | [Tavily](https://tavily.com/) 搜索 API（新闻搜索） | 推荐 |
@@ -58,6 +58,8 @@
 | `OPENAI_API_KEY` | OpenAI 兼容 API Key（备选） | 可选 |
 | `OPENAI_BASE_URL` | OpenAI 兼容 API 地址 | 可选 |
 | `OPENAI_MODEL` | OpenAI 兼容模型名称 | 可选 |
+
+> 💡 **多 Key 负载均衡**: `GEMINI_API_KEY` 支持配置多个 Key，用逗号分隔，如 `key1,key2,key3`。系统会随机选择一个 Key 使用，当某个 Key 触发限流（429）时自动切换到其他 Key，提高系统稳定性。
 
 > *注：`GEMINI_API_KEY` 和 `OPENAI_API_KEY` 至少配置一个，系统优先使用 Gemini
 
@@ -150,7 +152,7 @@ docker-compose logs -f
 
 ```bash
 # === 必填 ===
-GEMINI_API_KEY=your_gemini_key          # Gemini AI
+GEMINI_API_KEY=your_gemini_key          # Gemini AI（支持多个Key逗号分隔）
 WECHAT_WEBHOOK_URL=https://qyapi...     # 企业微信机器人
 STOCK_LIST=600519,300750,002594         # 自选股列表
 
@@ -162,6 +164,9 @@ GEMINI_MODEL_FALLBACK=gemini-2.5-flash  # 备选模型
 # === 可选 ===
 TUSHARE_TOKEN=your_token                # Tushare数据源
 SERPAPI_API_KEYS=your_serpapi_key       # 备用搜索
+
+# === 多 Key 示例（提高稳定性）===
+# GEMINI_API_KEY=AIza..key1,AIza..key2,AIza..key3
 ```
 
 ### 定时配置（GitHub Actions）

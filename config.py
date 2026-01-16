@@ -35,7 +35,7 @@ class Config:
     tushare_token: Optional[str] = None
     
     # === AI 分析配置 ===
-    gemini_api_key: Optional[str] = None
+    gemini_api_keys: List[str] = field(default_factory=list)  # 支持多个 Gemini API Keys
     gemini_model: str = "gemini-3-flash-preview"  # 主模型
     gemini_model_fallback: str = "gemini-2.5-flash"  # 备选模型
     
@@ -88,6 +88,11 @@ class Config:
     # 单例实例存储
     _instance: Optional['Config'] = None
     
+    @property
+    def gemini_api_key(self) -> Optional[str]:
+        """向后兼容：返回第一个 Gemini API Key"""
+        return self.gemini_api_keys[0] if self.gemini_api_keys else None
+    
     @classmethod
     def get_instance(cls) -> 'Config':
         """
@@ -128,6 +133,13 @@ class Config:
         if not stock_list:
             stock_list = ['600519', '000001', '300750']
         
+        # 解析 Gemini API Keys（支持多个 key，逗号分隔）
+        gemini_keys_str = os.getenv('GEMINI_API_KEY', '')
+        gemini_api_keys = [
+            k.strip() for k in gemini_keys_str.split(',') 
+            if k.strip() and not k.strip().startswith('your_') and len(k.strip()) > 10
+        ]
+        
         # 解析搜索引擎 API Keys（支持多个 key，逗号分隔）
         tavily_keys_str = os.getenv('TAVILY_API_KEYS', '')
         tavily_api_keys = [k.strip() for k in tavily_keys_str.split(',') if k.strip()]
@@ -138,7 +150,7 @@ class Config:
         return cls(
             stock_list=stock_list,
             tushare_token=os.getenv('TUSHARE_TOKEN'),
-            gemini_api_key=os.getenv('GEMINI_API_KEY'),
+            gemini_api_keys=gemini_api_keys,
             gemini_model=os.getenv('GEMINI_MODEL', 'gemini-3-flash-preview'),
             gemini_model_fallback=os.getenv('GEMINI_MODEL_FALLBACK', 'gemini-2.5-flash'),
             gemini_request_delay=float(os.getenv('GEMINI_REQUEST_DELAY', '2.0')),
@@ -180,10 +192,12 @@ class Config:
         if not self.tushare_token:
             warnings.append("提示：未配置 Tushare Token，将使用其他数据源")
         
-        if not self.gemini_api_key and not self.openai_api_key:
+        if not self.gemini_api_keys and not self.openai_api_key:
             warnings.append("警告：未配置 Gemini 或 OpenAI API Key，AI 分析功能将不可用")
-        elif not self.gemini_api_key:
+        elif not self.gemini_api_keys:
             warnings.append("提示：未配置 Gemini API Key，将使用 OpenAI 兼容 API")
+        elif len(self.gemini_api_keys) > 1:
+            warnings.append(f"提示：已配置 {len(self.gemini_api_keys)} 个 Gemini API Key，支持负载均衡和故障切换")
         
         if not self.tavily_api_keys and not self.serpapi_keys:
             warnings.append("提示：未配置搜索引擎 API Key (Tavily/SerpAPI)，新闻搜索功能将不可用")
