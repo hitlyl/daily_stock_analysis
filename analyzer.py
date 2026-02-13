@@ -683,11 +683,11 @@ class GeminiAnalyzer:
         
         优先级：Gemini（多 Key 轮换） > Gemini 备选模型 > OpenAI 兼容 API
         
-        处理 429 限流错误：
-        1. 先尝试切换到其他 API Key
-        2. 所有 Key 都失败后指数退避重试
-        3. 多次失败后切换到备选模型
-        4. Gemini 完全失败后尝试 OpenAI
+        处理策略（两层循环）：
+        - 外层：重试轮次（指数退避），每轮重置 Key 失败记录
+        - 内层：在每一轮中遍历所有可用 Key（无额外延迟）
+        - 重试一半后尝试切换备选模型
+        - Gemini 完全失败后尝试 OpenAI
         
         Args:
             prompt: 提示词
@@ -701,66 +701,73 @@ class GeminiAnalyzer:
             return self._call_openai_api(prompt, generation_config)
         
         config = get_config()
-        max_retries = config.gemini_max_retries
+        max_retries = config.gemini_max_retries  # 重试轮次数
         base_delay = config.gemini_retry_delay
         
         last_error = None
         tried_fallback = getattr(self, '_using_fallback', False)
+        total_keys = len(self._api_keys) if self._api_keys else 1
         
-        # 重置失败 key 记录（新请求周期开始）
-        self._reset_failed_keys()
-        
-        for attempt in range(max_retries):
-            try:
-                # 请求前增加延时（防止请求过快触发限流）
-                if attempt > 0:
-                    delay = base_delay * (2 ** (attempt - 1))  # 指数退避: 5, 10, 20, 40...
-                    delay = min(delay, 60)  # 最大60秒
-                    key_info = f"(Key #{self._current_key_index + 1})" if len(self._api_keys) > 1 else ""
-                    logger.info(f"[Gemini] 第 {attempt + 1} 次重试 {key_info}，等待 {delay:.1f} 秒...")
-                    time.sleep(delay)
+        for round_num in range(max_retries):
+            # 每轮开始前重置失败 key 记录，允许所有 key 再次尝试
+            self._reset_failed_keys()
+            
+            # 第二轮起，指数退避等待
+            if round_num > 0:
+                delay = base_delay * (2 ** (round_num - 1))  # 指数退避: 5, 10, 20, 40...
+                delay = min(delay, 60)  # 最大60秒
+                logger.info(f"[Gemini] 第 {round_num + 1}/{max_retries} 轮重试，等待 {delay:.1f} 秒...")
+                time.sleep(delay)
+            
+            # 内层循环：在本轮中遍历所有 Key（切换 Key 无额外延迟）
+            for key_attempt in range(total_keys):
+                key_info = f"(Key #{self._current_key_index + 1}/{total_keys})" if total_keys > 1 else ""
                 
-                response = self._model.generate_content(
-                    prompt,
-                    generation_config=generation_config,
-                    request_options={"timeout": 120}
-                )
-                
-                if response and response.text:
-                    return response.text
-                else:
-                    raise ValueError("Gemini 返回空响应")
+                try:
+                    if key_attempt > 0:
+                        logger.info(f"[Gemini] 轮次 {round_num + 1}，尝试 Key #{self._current_key_index + 1}/{total_keys}...")
                     
-            except Exception as e:
-                last_error = e
-                error_str = str(e)
-                
-                # 检查是否是 429 限流错误或配额错误
-                is_rate_limit = '429' in error_str or 'quota' in error_str.lower() or 'rate' in error_str.lower()
-                is_key_error = 'api_key' in error_str.lower() or 'invalid' in error_str.lower() or 'permission' in error_str.lower()
-                
-                key_info = f"(Key #{self._current_key_index + 1}/{len(self._api_keys)})" if len(self._api_keys) > 1 else ""
-                
-                if is_rate_limit or is_key_error:
-                    logger.warning(f"[Gemini] API 限流/错误 {key_info}，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+                    response = self._model.generate_content(
+                        prompt,
+                        generation_config=generation_config,
+                        request_options={"timeout": 120}
+                    )
                     
-                    # 优先尝试切换到其他 API Key
-                    if len(self._api_keys) > 1 and self._switch_to_next_key():
-                        logger.info(f"[Gemini] 已切换到新的 API Key，继续重试")
-                        continue  # 立即重试，不增加等待时间
+                    if response and response.text:
+                        return response.text
+                    else:
+                        raise ValueError("Gemini 返回空响应")
+                        
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e)
                     
-                    # 所有 key 都失败后，如果已经重试了一半次数且还没切换过备选模型，尝试切换模型
-                    if attempt >= max_retries // 2 and not tried_fallback:
-                        # 重置失败 key 记录，允许用不同模型再试一轮
-                        self._reset_failed_keys()
-                        if self._switch_to_fallback_model():
-                            tried_fallback = True
-                            logger.info("[Gemini] 已切换到备选模型，继续重试")
+                    # 检查是否是 429 限流错误或配额/Key 错误
+                    is_rate_limit = '429' in error_str or 'quota' in error_str.lower() or 'rate' in error_str.lower()
+                    is_key_error = 'api_key' in error_str.lower() or 'invalid' in error_str.lower() or 'permission' in error_str.lower()
+                    
+                    if is_rate_limit or is_key_error:
+                        logger.warning(f"[Gemini] API 限流/错误 {key_info}，轮次 {round_num + 1}/{max_retries}: {error_str[:100]}")
+                        
+                        # 尝试切换到本轮中下一个可用 Key（无延迟）
+                        if total_keys > 1 and self._switch_to_next_key():
+                            continue  # 立即尝试下一个 Key
                         else:
-                            logger.warning("[Gemini] 切换备选模型失败，继续使用当前模型重试")
-                else:
-                    # 非限流错误，记录并继续重试
-                    logger.warning(f"[Gemini] API 调用失败 {key_info}，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+                            break  # 本轮所有 Key 已耗尽，退出内层循环进入下一轮
+                    else:
+                        # 非限流错误，记录后也尝试换 Key
+                        logger.warning(f"[Gemini] API 调用失败 {key_info}，轮次 {round_num + 1}/{max_retries}: {error_str[:100]}")
+                        if total_keys > 1 and self._switch_to_next_key():
+                            continue
+                        else:
+                            break
+            
+            # 本轮所有 Key 都失败了，尝试切换备选模型
+            if round_num >= max_retries // 2 and not tried_fallback:
+                self._reset_failed_keys()
+                if self._switch_to_fallback_model():
+                    tried_fallback = True
+                    logger.info("[Gemini] 已切换到备选模型，下一轮将重试所有 Key")
         
         # Gemini 所有重试都失败，尝试 OpenAI 兼容 API
         if self._openai_client:
